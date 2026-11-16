@@ -188,6 +188,55 @@ static void kf_bfly5(
     }
 }
 
+#ifndef FIXED_POINT
+static void kf_bfly7(
+        kiss_fft_cpx * Fout,
+        const size_t fstride,
+        const kiss_fft_cfg st,
+        int m
+        )
+{
+    /* radix-7 butterfly using the conjugate symmetry of the 7th roots of unity.
+       out[k] = S_k - U_k, out[7-k] = S_k + U_k  (k=1..3), same scheme as kf_bfly5 */
+    kiss_fft_cpx * tw = st->twiddles;
+    const kiss_fft_scalar cc[4] = { 0, tw[fstride*m].r, tw[2*fstride*m].r, tw[3*fstride*m].r };
+    const kiss_fft_scalar ss[4] = { 0, tw[fstride*m].i, tw[2*fstride*m].i, tw[3*fstride*m].i };
+    int u, j, k;
+    for (u = 0; u < m; ++u) {
+        kiss_fft_cpx x[7], t[4], d[4], sk, uk;
+        x[0] = Fout[u];
+        C_FIXDIV(x[0],7);
+        for (j = 1; j < 7; ++j) {
+            kiss_fft_cpx v = Fout[u + j*m];
+            C_FIXDIV(v,7);
+            C_MUL(x[j], v, tw[j*u*fstride]);
+        }
+        for (j = 1; j <= 3; ++j) {
+            C_ADD(t[j], x[j], x[7-j]);
+            C_SUB(d[j], x[j], x[7-j]);
+        }
+        Fout[u].r = x[0].r + t[1].r + t[2].r + t[3].r;
+        Fout[u].i = x[0].i + t[1].i + t[2].i + t[3].i;
+        for (k = 1; k <= 3; ++k) {
+            sk = x[0];
+            uk.r = 0; uk.i = 0;
+            for (j = 1; j <= 3; ++j) {
+                int n = (k*j) % 7;
+                int ci = n > 3 ? 7 - n : n;
+                kiss_fft_scalar cs = cc[ci];
+                kiss_fft_scalar sn = n > 3 ? -ss[ci] : ss[ci];
+                sk.r += S_MUL(t[j].r, cs);
+                sk.i += S_MUL(t[j].i, cs);
+                uk.r += S_MUL(d[j].i, sn);
+                uk.i -= S_MUL(d[j].r, sn);
+            }
+            C_SUB(Fout[u + k*m], sk, uk);
+            C_ADD(Fout[u + (7-k)*m], sk, uk);
+        }
+    }
+}
+#endif /* FIXED_POINT */
+
 /* perform the butterfly for one stage of a mixed radix FFT */
 static void kf_bfly_generic(
         kiss_fft_cpx * Fout,
@@ -232,6 +281,80 @@ static void kf_bfly_generic(
     KISS_FFT_TMP_FREE(scratch);
 }
 
+/* Leaf stage (m==1): all twiddles are 1, read the p inputs directly from f
+   (stride s) instead of copying them into Fout first. */
+static void kf_leaf4(kiss_fft_cpx * Fout, const kiss_fft_cpx * f, const size_t s, const kiss_fft_cfg st)
+{
+    kiss_fft_cpx a = f[0], b = f[s], c = f[2*s], d = f[3*s];
+    kiss_fft_cpx t5, t3, t4;
+    C_FIXDIV(a,4); C_FIXDIV(b,4); C_FIXDIV(c,4); C_FIXDIV(d,4);
+    t5.r = a.r - c.r; t5.i = a.i - c.i;
+    a.r += c.r;       a.i += c.i;
+    t3.r = b.r + d.r; t3.i = b.i + d.i;
+    t4.r = b.r - d.r; t4.i = b.i - d.i;
+    Fout[2].r = a.r - t3.r; Fout[2].i = a.i - t3.i;
+    Fout[0].r = a.r + t3.r; Fout[0].i = a.i + t3.i;
+    if (st->inverse) {
+        Fout[1].r = t5.r - t4.i; Fout[1].i = t5.i + t4.r;
+        Fout[3].r = t5.r + t4.i; Fout[3].i = t5.i - t4.r;
+    } else {
+        Fout[1].r = t5.r + t4.i; Fout[1].i = t5.i - t4.r;
+        Fout[3].r = t5.r - t4.i; Fout[3].i = t5.i + t4.r;
+    }
+}
+
+static void kf_leaf2(kiss_fft_cpx * Fout, const kiss_fft_cpx * f, const size_t s)
+{
+    kiss_fft_cpx a = f[0], b = f[s];
+    C_FIXDIV(a,2); C_FIXDIV(b,2);
+    C_ADD(Fout[0], a, b);
+    C_SUB(Fout[1], a, b);
+}
+
+static void kf_leaf3(kiss_fft_cpx * Fout, const kiss_fft_cpx * f, const size_t s, const kiss_fft_cfg st, const size_t fstride)
+{
+    kiss_fft_cpx a = f[0], b = f[s], c = f[2*s];
+    kiss_fft_cpx s3, s0;
+    kiss_fft_cpx epi3 = st->twiddles[fstride];
+    C_FIXDIV(a,3); C_FIXDIV(b,3); C_FIXDIV(c,3);
+    C_ADD(s3,b,c);
+    C_SUB(s0,b,c);
+    Fout[1].r = a.r - HALF_OF(s3.r);
+    Fout[1].i = a.i - HALF_OF(s3.i);
+    C_MULBYSCALAR( s0 , epi3.i );
+    C_ADD(Fout[0], a, s3);
+    Fout[2].r = Fout[1].r + s0.i;
+    Fout[2].i = Fout[1].i - s0.r;
+    Fout[1].r -= s0.i;
+    Fout[1].i += s0.r;
+}
+
+static void kf_leaf5(kiss_fft_cpx * Fout, const kiss_fft_cpx * f, const size_t s, const kiss_fft_cfg st, const size_t fstride)
+{
+    kiss_fft_cpx x0 = f[0], x1 = f[s], x2 = f[2*s], x3 = f[3*s], x4 = f[4*s];
+    kiss_fft_cpx s7, s8, s9, s10, s5, s6, s11, s12;
+    kiss_fft_cpx ya = st->twiddles[fstride], yb = st->twiddles[fstride*2];
+    C_FIXDIV(x0,5); C_FIXDIV(x1,5); C_FIXDIV(x2,5); C_FIXDIV(x3,5); C_FIXDIV(x4,5);
+    C_ADD( s7,x1,x4);
+    C_SUB( s10,x1,x4);
+    C_ADD( s8,x2,x3);
+    C_SUB( s9,x2,x3);
+    Fout[0].r = x0.r + s7.r + s8.r;
+    Fout[0].i = x0.i + s7.i + s8.i;
+    s5.r = x0.r + S_MUL(s7.r,ya.r) + S_MUL(s8.r,yb.r);
+    s5.i = x0.i + S_MUL(s7.i,ya.r) + S_MUL(s8.i,yb.r);
+    s6.r =  S_MUL(s10.i,ya.i) + S_MUL(s9.i,yb.i);
+    s6.i = -S_MUL(s10.r,ya.i) - S_MUL(s9.r,yb.i);
+    C_SUB(Fout[1],s5,s6);
+    C_ADD(Fout[4],s5,s6);
+    s11.r = x0.r + S_MUL(s7.r,yb.r) + S_MUL(s8.r,ya.r);
+    s11.i = x0.i + S_MUL(s7.i,yb.r) + S_MUL(s8.i,ya.r);
+    s12.r = - S_MUL(s10.i,yb.i) + S_MUL(s9.i,ya.i);
+    s12.i = S_MUL(s10.r,yb.i) - S_MUL(s9.r,ya.i);
+    C_ADD(Fout[2],s11,s12);
+    C_SUB(Fout[3],s11,s12);
+}
+
 static
 void kf_work(
         kiss_fft_cpx * Fout,
@@ -265,6 +388,9 @@ void kf_work(
             case 3: kf_bfly3(Fout,fstride,st,m); break;
             case 4: kf_bfly4(Fout,fstride,st,m); break;
             case 5: kf_bfly5(Fout,fstride,st,m); break;
+#ifndef FIXED_POINT
+            case 7: kf_bfly7(Fout,fstride,st,m); break;
+#endif
             default: kf_bfly_generic(Fout,fstride,st,m,p); break;
         }
         return;
@@ -272,6 +398,13 @@ void kf_work(
 #endif
 
     if (m==1) {
+        switch (p) {
+            case 2: kf_leaf2(Fout,f,fstride*in_stride); return;
+            case 3: kf_leaf3(Fout,f,fstride*in_stride,st,fstride); return;
+            case 4: kf_leaf4(Fout,f,fstride*in_stride,st); return;
+            case 5: kf_leaf5(Fout,f,fstride*in_stride,st,fstride); return;
+            default: break;
+        }
         do{
             *Fout = *f;
             f += fstride*in_stride;
@@ -295,6 +428,9 @@ void kf_work(
         case 3: kf_bfly3(Fout,fstride,st,m); break;
         case 4: kf_bfly4(Fout,fstride,st,m); break;
         case 5: kf_bfly5(Fout,fstride,st,m); break;
+#ifndef FIXED_POINT
+            case 7: kf_bfly7(Fout,fstride,st,m); break;
+#endif
         default: kf_bfly_generic(Fout,fstride,st,m,p); break;
     }
 }
